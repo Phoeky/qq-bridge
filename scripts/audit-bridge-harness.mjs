@@ -21,6 +21,8 @@ import * as tokenLedger from '../src/token-ledger.js';
 import * as voiceLib from '../src/send-voice-lib.js';
 import * as presetPrompt from '../src/preset-prompt.js';
 import * as stateAcl from '../src/state-acl.mjs';
+import * as roleCard from '../src/role-card.js';
+import { createMemoryPlugin } from '../src/memory/index.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -187,7 +189,12 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     SnowLumaWebSocketClient: FakeBot, text: (s) => s,
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
-    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt,
+    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt, ...roleCard,
+    // 记忆插件在 VM 里也必须可用：bridge.js 的 import 会被下面整段剥掉，
+    // 少了这一项，任何走进 encode/render 的用例都会 ReferenceError（R1~R16 全挂）。
+    // 直接用真实现：它只用 node 内置模块 + src/memory/*；记忆目录由 bridge 按 ROOT 计算，
+    // 而 ROOT 已被重写成 harness 的 temp 目录，所以不会碰真实 state/。
+    createMemoryPlugin,
     // 桥接的出图出口会调归一化（体积/动图抽帧）：VM 里必须能拿到这几个函数。
     normalizeImageForModel: mediaNormalize.normalizeImageForModel,
     sniffImage: mediaNormalize.sniffImage,

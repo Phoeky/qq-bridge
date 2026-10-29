@@ -54,6 +54,9 @@ import {
   applyStickerNote,
   markStickerUsed
 } from './sticker-lib.js';
+// 模拟人类记忆的记忆插件（P1 JSON 后端）：事件流 + 遗忘曲线 + 权重 + 人设锚。
+// 它只负责"记什么、记多久、怎么取"，何时 encode/render/checkpoint 由本文件决定。
+import { createMemoryPlugin } from './memory/index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -872,6 +875,19 @@ function loadConfig() {
         maxCount: 5
       },
       ...(file.socialV2 ?? {})
+    },
+    // 模拟人类记忆的记忆插件（详见 docs/design/MEMORY_PLUGIN_DESIGN.md）。
+    // P1 用纯 JSON：state/memory/<会话 key>/ 下是事件流 JSONL + 画像/人设锚 JSON。
+    memory: {
+      enabled: true,
+      dir: 'state/memory',
+      budgetChars: 1200,       // 一次注入的记忆文本预算（字符）
+      anchorMaxChars: 400,     // 人设锚长度上限
+      eventThreshold: 0.45,    // salience 达到该值才写入长期记忆
+      recentDays: 7,           // “最近的记忆”回看窗口（天）
+      recallMinW: 0.35,        // cue 检索时允许注入的最小权重
+      maxEventsRead: 5000,     // 启动/重载时最多读入内存的事件条数
+      ...(file.memory ?? {})
     }
   };
 
@@ -1388,6 +1404,32 @@ async function main() {
   hardenStateDirAcl();
   acquireLock();
   loadState();
+
+  // ── 记忆插件（模拟人类记忆，P1 JSON 后端） ──────────────────────────────
+  // 为什么不继续往 social-v2.json 里加字段：事件流只增不改、按会话分目录、
+  // 能独立跑迁移/清理，坏一份也不会把 social-v2 整个带塌。
+  // 这里只创建实例；真正的 encode/render/checkpoint 挂在消息入库、唤醒提示、退役三处。
+  const memoryPlugin = createMemoryPlugin({
+    stateDir: path.resolve(ROOT, String(cfg.memory?.dir || 'state/memory')),
+    config: cfg.memory ?? {},
+    log: (line) => log(line),
+    // 人设锚来源：当前角色卡。roleRawContent() 已做角色名校验与 mtime 缓存；
+    // 模式过滤（〔一代〕/〔二代〕）在桥接这边做完再交给记忆模块——记忆模块不依赖
+    // role-card.js，整个 src/memory/ 可以独立拷走/独立测试。
+    getRoleInfo: () => {
+      const raw = roleRawContent();
+      if (!raw) return null;
+      const safeName = sanitizeRoleName(readRoleState().role);
+      if (!safeName) return null;
+      let stamp = safeName;
+      try {
+        const stat = fs.statSync(path.join(ROLES_DIR, safeName + '.md'));
+        stamp = `${safeName}:${stat.mtimeMs}:${stat.size}`;
+      } catch {}
+      return { name: safeName, text: selectRoleText(raw, 'v2'), stamp };
+    }
+  });
+  if (memoryPlugin.enabled) log(`🧠 记忆插件已启用：${path.resolve(ROOT, String(cfg.memory?.dir || 'state/memory'))}`);
 
   // ── 群聊黑话/网络用语学习（slang） ──────────────────────────────────────
   let slangEntries = [];
@@ -2796,6 +2838,9 @@ async function main() {
       st.bootstrapSent = false;
       st.modelSeenSeqs = new Set();
     }
+    // 退役 ≠ 失忆：记忆按会话 key 保留，这里只做一次落盘 + 清理，
+    // 让下次重建会话时还认得人、还记得上次聊到哪（这正是"性格重置"的一半解药）。
+    try { memoryPlugin?.checkpoint(key); } catch (error) { log(`⚠️ 记忆检查点失败 ${key}：${error?.message ?? error}`); }
     saveState();
     saveSocialV2State();
     stopRetiredSessionWork(sessionId, key);
@@ -4142,6 +4187,84 @@ async function main() {
           return;
         }
 
+        // ── 记忆插件（模拟人类记忆）─────────────────────────────────────────
+        //
+        // 设计上刻意保持低耦合：这一组接口只调用 memoryPlugin 的公开方法，
+        // 不碰它的内部结构；关掉记忆后，唤醒提示自动回落到原来的 formatMemoryV2 便签，
+        // 删除 src/memory/ 目录 + 本组接口即可完全移除该功能。
+        if (req.method === 'GET' && url.pathname === '/api/memory') {
+          const { sessions, totals } = memoryPlugin.overview();
+          sendJson({
+            ok: true,
+            enabled: memoryPlugin.enabled,
+            dir: path.resolve(ROOT, String(cfg.memory?.dir || 'state/memory')),
+            config: {
+              budgetChars: memoryPlugin.config.budgetChars,
+              anchorMaxChars: memoryPlugin.config.anchorMaxChars,
+              eventThreshold: memoryPlugin.config.eventThreshold,
+              recentDays: memoryPlugin.config.recentDays,
+              recallMinW: memoryPlugin.config.recallMinW,
+            },
+            totals,
+            sessions
+          });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/memory/enabled') {
+          const body = await readBody();
+          if (typeof body.enabled !== 'boolean') { sendJson({ ok: false, error: 'enabled 必须是布尔值' }, 400); return; }
+          const configFile = path.join(ROOT, 'config.json');
+          const file = readConfigObject(configFile);
+          file.memory = { ...(file.memory ?? {}), enabled: body.enabled };
+          atomicWriteJson(configFile, file);
+          cfg.memory = { ...(cfg.memory ?? {}), enabled: body.enabled };
+          memoryPlugin.setEnabled(body.enabled);
+          log(`控制台：记忆插件已${body.enabled ? '开启' : '关闭'}（已写入 config.json，无需重启）`);
+          sendJson({ ok: true, enabled: memoryPlugin.enabled });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/memory/config') {
+          const body = await readBody();
+          const pick = (value, min, max) => {
+            const n = Number(value);
+            if (!Number.isFinite(n)) return null;
+            return Math.round(Math.min(max, Math.max(min, n)));
+          };
+          const next = {};
+          const budget = pick(body.budgetChars, 200, 6000);
+          if (budget !== null) next.budgetChars = budget;
+          const anchor = pick(body.anchorMaxChars, 80, 800);
+          if (anchor !== null) next.anchorMaxChars = anchor;
+          const threshold = Number(body.eventThreshold);
+          if (Number.isFinite(threshold)) next.eventThreshold = Math.min(1, Math.max(0, Number(threshold.toFixed(3))));
+          const recent = pick(body.recentDays, 1, 30);
+          if (recent !== null) next.recentDays = recent;
+          if (!Object.keys(next).length) { sendJson({ ok: false, error: '没有可更新的字段' }, 400); return; }
+          const configFile = path.join(ROOT, 'config.json');
+          const file = readConfigObject(configFile);
+          file.memory = { ...(file.memory ?? {}), ...next };
+          atomicWriteJson(configFile, file);
+          cfg.memory = { ...(cfg.memory ?? {}), ...next };
+          const applied = memoryPlugin.updateConfig(next);
+          log(`控制台：记忆参数已更新 ${JSON.stringify(applied)}（已写入 config.json）`);
+          sendJson({ ok: true, config: applied });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/memory/reset') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          if (key) {
+            memoryPlugin.reset(key);
+            log(`控制台：已清空会话 ${key} 的记忆`);
+            sendJson({ ok: true, key });
+          } else {
+            const cleared = memoryPlugin.resetAll();
+            log(`控制台：已清空全部记忆（${cleared} 个会话目录）`);
+            sendJson({ ok: true, cleared });
+          }
+          return;
+        }
+
         // ── 安全拦截通知设置 ─────────────────────────────────────────────────
         if (req.method === 'GET' && url.pathname === '/api/security') {
           sendJson({
@@ -4611,6 +4734,7 @@ async function main() {
             delete state.sessionPolicies[key];
             forgetAgentToken(key);
             socialV2.conversations.delete(key);
+            try { memoryPlugin?.reset(key); } catch (error) { log(`⚠️ 记忆重置失败 ${key}：${error?.message ?? error}`); }
             seenForwardIds.delete(key);
           }
           saveState();
@@ -7087,6 +7211,7 @@ async function main() {
           wakeConfigMissCount.delete(key);
           forgetAgentToken(key);
           socialV2.conversations.delete(key);
+          try { memoryPlugin?.reset(key); } catch (error) { log(`⚠️ 记忆重置失败 ${key}：${error?.message ?? error}`); }
           seenForwardIds.delete(key);
           saveSocialV2State();
           saveState();
@@ -9864,6 +9989,8 @@ async function main() {
       const participantHit = Array.isArray(t.participants) && t.participants.some((p) => p && lowerPlain.includes(String(p)));
       if (topicHit || participantHit) t.lastMentionAt = Date.now();
     }
+    // 写入记忆插件：salience 不够的闲聊不会进事件流，但仍会更新「关于他们」的画像。
+    try { memoryPlugin?.encode(key, msg); } catch (error) { log(`⚠️ 记忆编码失败 ${key}：${error?.message ?? error}`); }
     saveSocialV2State();
   }
 
@@ -9906,6 +10033,8 @@ async function main() {
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     st.unread.push(msg);
     if (st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
+    // 拍一拍是强制记忆（kind='poke'），即使 salience 低也落盘。
+    try { memoryPlugin?.encode(key, msg); } catch (error) { log(`⚠️ 记忆编码失败 ${key}：${error?.message ?? error}`); }
     saveSocialV2State();
     return msg;
   }
@@ -9933,6 +10062,10 @@ async function main() {
     st.preSleepWaitSatisfiedAt = 0;
     st.preSleepWaitObservedAt = 0;
     st.preSleepWaitAccumMs = 0;
+    // 自己说过的话也进记忆：人格连续性靠「我记得我说过什么」。
+    try {
+      memoryPlugin?.encodeSelf(key, list.map((item) => redactKnownTokensOnly(String(item ?? '')).slice(0, 200)).filter(Boolean));
+    } catch (error) { log(`⚠️ 记忆编码失败 ${key}：${error?.message ?? error}`); }
     saveSocialV2State();
   }
 
@@ -10293,10 +10426,17 @@ async function main() {
   function buildWakePromptV2(key, reason) {
     const roleState = readRoleState();
     const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
+    // 人设锚：从角色卡抽出的常驻短摘要（≤400 字）。只给名字的话，长会话里人格容易漂；
+    // 常驻一小段"我是谁、怎么说话"比每次靠 qq_get_prompt 现拉更稳，也不占多少预算。
+    const anchorText = memoryPlugin?.renderAnchor(key) || '';
+    const anchorLine = anchorText ? `【人设锚】${anchorText}\n\n` : '';
     const identityLine = selfIdentityTextV2();
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
-    const memoryText = formatMemoryV2(st);
+    // 检索线索取最近一条别人说的话：cue 命中旧事时才会把「相关的回忆」带进来。
+    const lastIncoming = [...(Array.isArray(st.unread) ? st.unread : [])].reverse().find((m) => m && !m.isSelf);
+    const cueText = String(lastIncoming?.plain || lastIncoming?.text || '').slice(0, 120);
+    const memoryText = (memoryPlugin?.render(key, { cue: cueText, socialSt: st }) || '') || formatMemoryV2(st);
     const memoryLine = memoryText ? `${memoryText}\n\n` : '';
     // 注意：黑话表不在这里注入，deliverPromptNow 的 withSlangContext 会统一注入，
     // 避免唤醒 prompt 出现两份黑话表。
@@ -10343,7 +10483,7 @@ async function main() {
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
     // 时间感放在 base 的最末尾：紧接着就是【唤醒】原因与行动指令，位置最显眼。
     const timeSenseLine = buildTimeSenseLine(st);
-    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + timeSenseLine;
+    const base = roleLine + anchorLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
@@ -10370,11 +10510,13 @@ async function main() {
   function buildWakeReminderPromptV2(key) {
     const roleState = readRoleState();
     const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
+    const anchorText = memoryPlugin?.renderAnchor(key) || '';
+    const anchorLine = anchorText ? `【人设锚】${anchorText}\n\n` : '';
     const identityLine = selfIdentityTextV2();
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
-    return `${roleLine}${identityLine}${tokenLine}【提醒】你还没有完成回合收尾。请调用 qq_set_wake_config 设置下一次唤醒条件（例如继续潜水多久、@/名字/关键词/提问/概率/指定成员等），或者调用 qq_mark_read 表示你看过且决定不接。这是为了防止你忘记收尾后进入“永眠”。注意：设置潜水前先用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察；等待期间有人说话时查看 newMessages，判断不需要你参与即可收尾。`;
+    return `${roleLine}${anchorLine}${identityLine}${tokenLine}【提醒】你还没有完成回合收尾。请调用 qq_set_wake_config 设置下一次唤醒条件（例如继续潜水多久、@/名字/关键词/提问/概率/指定成员等），或者调用 qq_mark_read 表示你看过且决定不接。这是为了防止你忘记收尾后进入“永眠”。注意：设置潜水前先用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察；等待期间有人说话时查看 newMessages，判断不需要你参与即可收尾。`;
   }
 
   async function sendWakePromptV2(key, reason) {
@@ -10925,6 +11067,7 @@ async function main() {
           wakeConfigMissCount.delete(key);
           forgetAgentToken(key);
           socialV2.conversations.delete(key);
+          try { memoryPlugin?.reset(key); } catch (error) { log(`⚠️ 记忆重置失败 ${key}：${error?.message ?? error}`); }
           seenForwardIds.delete(key);
           saveSocialV2State();
           saveState();
